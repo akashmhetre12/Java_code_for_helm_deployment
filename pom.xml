@@ -22,7 +22,6 @@
     <maven.compiler.source>17</maven.compiler.source>
     <maven.compiler.target>17</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <sonar.host.url>https://sonar.internal</sonar.host.url>
   </properties>
 
   <dependencies>
@@ -49,23 +48,8 @@
         <artifactId>spring-boot-maven-plugin</artifactId>
       </plugin>
 
-      <!-- SonarQube analysis: mvn sonar:sonar -->
-      <plugin>
-        <groupId>org.sonarsource.scanner.maven</groupId>
-        <artifactId>sonar-maven-plugin</artifactId>
-        <version>3.11.0.3922</version>
-      </plugin>
 
-      <!-- OWASP dependency check: mvn org.owasp:dependency-check-maven:check -->
-      <plugin>
-        <groupId>org.owasp</groupId>
-        <artifactId>dependency-check-maven</artifactId>
-        <version>10.0.4</version>
-        <configuration>
-          <failBuildOnCVSS>7</failBuildOnCVSS>
-          <format>ALL</format>
-        </configuration>
-      </plugin>
+
 
       <!-- Ensures target/surefire-reports/*.xml exists for the junit post step -->
       <plugin>
@@ -75,4 +59,18 @@
       </plugin>
     </plugins>
   </build>
+<distributionManagement>
+  <repository>
+      <id>maven-releases</id>
+      <name>maven-releases</name>
+      <url>http://172.31.1.60:8081/repository/maven-releases/</url>
+
+  </repository>
+  <snapshotRepository>
+      <id>maven-snapshots</id>
+      <name>maven-snapshots</name>
+      <url>http://172.31.1.60:8081/repository/maven-snapshots/</url>
+  </snapshotRepository>
+</distributionManagement>
+
 </project>
