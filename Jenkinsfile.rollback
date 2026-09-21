@@ -1,0 +1,158 @@
+// ============================================================
+// JOB 2: myapp-rollback (Helm)
+// Trigger: MANUAL ONLY.
+// Uses Helm's own release history — no ReplicaSet-hunting needed.
+// ============================================================
+pipeline {
+  agent any
+
+  parameters {
+    choice(name: 'ENV', choices: ['uat', 'prod'], description: 'Target environment')
+    string(name: 'REVISION', defaultValue: '',
+           description: 'Helm release revision number to roll back to. Leave blank to auto-resolve from ROLLBACK_TO_IMAGE_TAG, or leave both blank for previous revision.')
+    string(name: 'ROLLBACK_TO_IMAGE_TAG', defaultValue: '',
+           description: 'Known-good image tag (git-sha) to roll back to — use this when the current deploy is technically healthy (pods running, passed readiness) but has a functional/logic bug. Pipeline resolves this to the matching Helm revision automatically.')
+    string(name: 'INCIDENT_TICKET', defaultValue: '', description: 'Required for audit trail')
+  }
+
+  environment {
+    CLUSTER   = 'my-eks-cluster'
+    REGION    = 'ap-south-1'
+    NAMESPACE = "${params.ENV}"
+    RELEASE   = "myapp-${params.ENV}"
+  }
+
+  stages {
+
+    stage('Validate inputs') {
+      steps {
+        script {
+          if (!params.INCIDENT_TICKET?.trim()) {
+            error("INCIDENT_TICKET is required.")
+          }
+        }
+      }
+    }
+
+    stage('Update kubeconfig') {
+      steps {
+        sh "aws eks update-kubeconfig --name ${CLUSTER} --region ${REGION}"
+      }
+    }
+
+    stage('Show release history') {
+      steps {
+        sh "helm history ${RELEASE} -n ${NAMESPACE}"
+        // this is the big Helm advantage over raw kubectl — full versioned history
+        // with what changed at each revision, visible before you decide
+      }
+    }
+
+    stage('Resolve revision from image tag') {
+      // only runs when a tag was given instead of a raw revision number —
+      // this is the path for "deploy succeeded, pods healthy, but code is buggy"
+      when { expression { !params.REVISION?.trim() && params.ROLLBACK_TO_IMAGE_TAG?.trim() } }
+      steps {
+        script {
+          def history = sh(
+            script: "helm history ${RELEASE} -n ${NAMESPACE} -o json",
+            returnStdout: true
+          ).trim()
+          def revisions = readJSON(text: history)
+          def matchedRevision = null
+
+          // walk revisions newest-first, check each one's recorded image.tag,
+          // stop at the first (most recent) match with a "deployed"/"superseded" status
+          revisions.sort { -it.revision }.each { rev ->
+            if (matchedRevision == null && (rev.status == 'deployed' || rev.status == 'superseded')) {
+              def valuesJson = sh(
+                script: "helm get values ${RELEASE} -n ${NAMESPACE} --revision ${rev.revision} -o json",
+                returnStdout: true
+              ).trim()
+              def values = readJSON(text: valuesJson)
+              if (values.image?.tag == params.ROLLBACK_TO_IMAGE_TAG) {
+                matchedRevision = rev.revision
+              }
+            }
+          }
+
+          if (matchedRevision == null) {
+            error("No revision found in Helm history for image tag ${params.ROLLBACK_TO_IMAGE_TAG} on ${RELEASE}. Check 'helm history ${RELEASE} -n ${NAMESPACE}' manually — it may have aged out of history (see revisionHistoryLimit / --history-max).")
+          }
+
+          env.RESOLVED_REVISION = matchedRevision.toString()
+          echo "Resolved image tag ${params.ROLLBACK_TO_IMAGE_TAG} -> Helm revision ${env.RESOLVED_REVISION}"
+        }
+      }
+    }
+
+    stage('Approval') {
+      steps {
+        script {
+          def target = params.REVISION?.trim() ?: (env.RESOLVED_REVISION ?: 'previous revision')
+          input message: "Confirm Helm rollback of ${RELEASE} on ${params.ENV} to revision ${target}${params.ROLLBACK_TO_IMAGE_TAG ? ' (image tag ' + params.ROLLBACK_TO_IMAGE_TAG + ')' : ''} — ticket: ${params.INCIDENT_TICKET}?", ok: 'Rollback'
+        }
+      }
+    }
+
+    stage('Helm rollback') {
+      steps {
+        script {
+          def targetRevision = params.REVISION?.trim() ?: env.RESOLVED_REVISION
+          if (targetRevision) {
+            sh "helm rollback ${RELEASE} ${targetRevision} -n ${NAMESPACE} --wait --timeout 3m"
+          } else {
+            sh "helm rollback ${RELEASE} -n ${NAMESPACE} --wait --timeout 3m"
+          }
+        }
+        // helm rollback updates Helm's release state AND the cluster in one atomic action —
+        // this is the step that was two manual actions (kubectl undo + separate values sync)
+        // in the raw-kubectl version
+      }
+    }
+
+    stage('Rollout verification') {
+      steps {
+        sh "kubectl rollout status deployment/${RELEASE} -n ${NAMESPACE} --timeout=120s"
+      }
+    }
+
+    stage('Smoke test') {
+      steps {
+        sh "curl -f --max-time 10 https://${params.ENV}.internal.myapp.com/healthz"
+      }
+    }
+
+    stage('Sync chart repo values') {
+      steps {
+        dir('helm-charts') {
+          git branch: 'main', url: 'git@github.com:org/helm-charts.git', credentialsId: 'chart-repo-deploy-key'
+          sh """
+            ROLLED_BACK_TAG=\$(helm get values ${RELEASE} -n ${NAMESPACE} -o json | jq -r '.image.tag')
+            yq e -i ".image.tag = \\"\$ROLLED_BACK_TAG\\"" charts/myapp/values-${params.ENV}.yaml
+            git commit -am "rollback myapp to \$ROLLED_BACK_TAG on ${params.ENV} (ticket: ${params.INCIDENT_TICKET})" || echo "no diff"
+            git push origin main
+          """
+          // still needed even with Helm — Helm's release history lives in the cluster
+          // (as a Secret), Git values file is a separate source of truth that must
+          // be kept in sync or the next `helm upgrade` re-introduces the bad tag
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      sh """
+        curl -X POST -H 'Content-type: application/json' \
+          -d '{"text":"⏪ Helm rolled back ${RELEASE} on ${params.ENV} (ticket: ${params.INCIDENT_TICKET})"}' \$SLACK_WEBHOOK
+      """
+    }
+    failure {
+      sh """
+        curl -X POST -H 'Content-type: application/json' \
+          -d '{"text":"🚨 Helm rollback FAILED on ${params.ENV} (ticket: ${params.INCIDENT_TICKET}) — manual intervention needed"}' \$SLACK_WEBHOOK
+      """
+    }
+  }
+}

@@ -1,0 +1,157 @@
+// ============================================================
+// JOB 2: myapp-deploy-prod
+// Trigger: MANUAL ONLY — no webhook, no auto-chain from Job 1.
+// Takes the IMAGE_TAG that was already built, scanned, and
+// validated in UAT by myapp-ci-uat. Never rebuilds anything.
+// RBAC: this job's credentials/IAM role scoped to PROD namespace only.
+// ============================================================
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'IMAGE_TAG', defaultValue: '', description: 'Git-sha image tag that was validated in UAT (from myapp-ci-uat build). Required.')
+    string(name: 'PROD_NAMESPACE', defaultValue: 'prod', description: 'Prod namespace to deploy to')
+  }
+
+  environment {
+    ECR_REPO   = '123456789.dkr.ecr.ap-south-1.amazonaws.com/myapp'
+    CLUSTER    = 'my-eks-cluster'
+    REGION     = 'ap-south-1'
+    CHART_DIR  = 'charts/myapp'
+    RELEASE    = "myapp-${params.PROD_NAMESPACE}"
+  }
+
+  stages {
+
+    stage('Validate inputs') {
+      steps {
+        script {
+          if (!params.IMAGE_TAG?.trim()) {
+            error("IMAGE_TAG is required — get it from the myapp-ci-uat build that deployed to UAT.")
+          }
+        }
+      }
+    }
+
+    stage('Validate image exists in ECR') {
+      steps {
+        sh """
+          aws ecr describe-images --repository-name myapp \
+            --image-ids imageTag=${params.IMAGE_TAG} --region ${REGION}
+        """
+        // fails fast if someone typos a tag or references one that was never built
+      }
+    }
+
+    stage('Checkout chart repo') {
+      steps {
+        dir('helm-charts') {
+          git branch: 'main', url: 'git@github.com:org/helm-charts.git', credentialsId: 'chart-repo-deploy-key'
+        }
+      }
+    }
+
+    stage('Update kubeconfig') {
+      steps {
+        // separate credentials from myapp-ci-uat — this identity has NO uat namespace access,
+        // only prod, so the RBAC boundary holds even if this job is compromised
+        sh "aws eks update-kubeconfig --name ${CLUSTER} --region ${REGION}"
+      }
+    }
+
+    stage('Helm diff - PROD') {
+      steps {
+        dir('helm-charts') {
+          sh """
+            helm diff upgrade ${RELEASE} ${CHART_DIR} \
+              -f ${CHART_DIR}/values-${params.PROD_NAMESPACE}.yaml \
+              --set image.tag=${params.IMAGE_TAG} \
+              -n ${params.PROD_NAMESPACE} || true
+          """
+        }
+      }
+    }
+
+    stage('Approval for PROD') {
+      steps {
+        script {
+          def approver = input(
+            message: "Deploy ${params.IMAGE_TAG} to PROD (${params.PROD_NAMESPACE})? Confirm this tag was validated in UAT.",
+            ok: 'Deploy',
+            submitter: 'release-approvers',
+            submitterParameter: 'PROD_APPROVER'
+          )
+        }
+        echo "PROD deploy approved by ${env.PROD_APPROVER}"
+      }
+    }
+
+    stage('Bump PROD values + commit') {
+      steps {
+        dir('helm-charts') {
+          sh """
+            yq e -i '.image.tag = "${params.IMAGE_TAG}"' ${CHART_DIR}/values-${params.PROD_NAMESPACE}.yaml
+            git commit -am "deploy myapp ${params.IMAGE_TAG} to ${params.PROD_NAMESPACE} (approved by ${env.PROD_APPROVER}) [ci skip]"
+            git push origin main
+          """
+        }
+      }
+    }
+
+    stage('Deploy to PROD') {
+      steps {
+        dir('helm-charts') {
+          sh """
+            helm upgrade --install ${RELEASE} ${CHART_DIR} \
+              -f ${CHART_DIR}/values-${params.PROD_NAMESPACE}.yaml \
+              --set image.tag=${params.IMAGE_TAG} \
+              -n ${params.PROD_NAMESPACE} --atomic --timeout 3m --wait
+          """
+        }
+      }
+    }
+
+    stage('Smoke test - PROD') {
+      steps {
+        sh "curl -f --max-time 10 https://${params.PROD_NAMESPACE}.internal.myapp.com/healthz"
+      }
+    }
+  }
+
+  post {
+    success {
+      sh """
+        curl -X POST -H 'Content-type: application/json' \
+          -d '{"text":"✅ myapp ${params.IMAGE_TAG} deployed to ${params.PROD_NAMESPACE} (approved by ${env.PROD_APPROVER})"}' \$SLACK_WEBHOOK
+      """
+      sh """
+        curl -X POST \${GRAFANA_URL}/api/annotations \
+          -H "Authorization: Bearer \$GRAFANA_TOKEN" -H "Content-Type: application/json" \
+          -d '{"text":"prod deploy myapp ${params.IMAGE_TAG}","tags":["deploy","prod"]}'
+      """
+    }
+    failure {
+      // --atomic already reverted the cluster; sync git to match.
+      dir('helm-charts') {
+        sh """
+          if helm status ${RELEASE} -n ${params.PROD_NAMESPACE} >/dev/null 2>&1; then
+            LAST_GOOD=\$(helm get values ${RELEASE} -n ${params.PROD_NAMESPACE} -o json | jq -r '.image.tag')
+            yq e -i ".image.tag = \\"\$LAST_GOOD\\"" ${CHART_DIR}/values-${params.PROD_NAMESPACE}.yaml
+            git commit -am "sync values after PROD deploy failure" || true
+            git push origin main || true
+          fi
+        """
+      }
+      sh """
+        curl -X POST -H 'Content-type: application/json' \
+          -d '{"text":"❌ myapp-deploy-prod FAILED for ${params.IMAGE_TAG} — --atomic auto-reverted PROD"}' \$SLACK_WEBHOOK
+      """
+    }
+    aborted {
+      sh """
+        curl -X POST -H 'Content-type: application/json' \
+          -d '{"text":"⏸️ myapp-deploy-prod aborted for ${params.IMAGE_TAG} — approval declined or timed out"}' \$SLACK_WEBHOOK
+      """
+    }
+  }
+}

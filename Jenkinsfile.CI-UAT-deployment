@@ -1,0 +1,214 @@
+// ============================================================
+// JOB 1: myapp-ci-uat
+// Trigger: AUTOMATIC — webhook on push/merge to app repo
+// checkout -> test -> sonar -> owasp -> build -> nexus -> image ->
+// trivy -> ecr -> [MANUAL INPUT] -> deploy to UAT (namespace param)
+// ============================================================
+pipeline {
+  agent any
+
+  triggers {
+    githubPush()   // or pollSCM('H/5 * * * *') depending on your webhook setup
+  }
+
+  parameters {
+    string(name: 'UAT_NAMESPACE', defaultValue: 'uat', description: 'UAT namespace to deploy to — separated so multiple UAT envs (uat, uat2, qa) can share this same job')
+  }
+
+  environment {
+    ECR_REPO     = '123456789.dkr.ecr.ap-south-1.amazonaws.com/myapp'
+    CLUSTER      = 'my-eks-cluster'
+    REGION       = 'ap-south-1'
+    NEXUS_URL    = 'https://nexus.internal:8081/repository/maven-releases'
+    SONAR_URL    = 'https://sonar.internal'
+    CHART_DIR    = 'charts/myapp'
+    IMAGE_TAG    = "${env.GIT_COMMIT[0..7]}"   // this is the artifact BOTH jobs key off of
+    RELEASE      = "myapp-${params.UAT_NAMESPACE}"
+  }
+
+  stages {
+
+    // ============ CI: build & quality gates ============
+
+    stage('Checkout app repo') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Unit tests') {
+      steps {
+        sh 'mvn test'
+      }
+      post {
+        always { junit '**/target/surefire-reports/*.xml' }
+      }
+    }
+
+    stage('SonarQube quality gate') {
+      steps {
+        withSonarQubeEnv('sonar-server') {
+          sh "mvn sonar:sonar -Dsonar.host.url=${SONAR_URL}"
+        }
+        timeout(time: 5, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+
+    stage('OWASP dependency check') {
+      steps {
+        sh 'mvn org.owasp:dependency-check-maven:check -DnvdApiUrl=$NVD_MIRROR_URL'
+      }
+      post {
+        always { dependencyCheckPublisher pattern: 'target/dependency-check-report.xml' }
+      }
+    }
+
+    stage('Build artifact') {
+      steps {
+        sh 'mvn clean package -DskipTests'
+      }
+    }
+
+    stage('Push artifact to Nexus') {
+      steps {
+        sh 'mvn deploy:deploy-file -Durl=$NEXUS_URL -DrepositoryId=nexus -Dfile=target/myapp.jar'
+      }
+    }
+
+    // ============ Image build & scan ============
+
+    stage('Build image') {
+      steps {
+        sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} --build-arg NEXUS_URL=${NEXUS_URL} ."
+      }
+    }
+
+    stage('Trivy image scan') {
+      steps {
+        sh "trivy image --severity CRITICAL,HIGH --exit-code 1 ${ECR_REPO}:${IMAGE_TAG}"
+      }
+    }
+
+    stage('Push image to ECR') {
+      steps {
+        sh """
+          aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REPO}
+          docker push ${ECR_REPO}:${IMAGE_TAG}
+        """
+      }
+    }
+
+    // ============ Manual gate before touching any cluster ============
+
+    stage('Approval for UAT deploy') {
+      steps {
+        script {
+          def approver = input(
+            message: "CI passed for ${IMAGE_TAG}. Deploy to UAT (${params.UAT_NAMESPACE})?",
+            ok: 'Deploy',
+            submitter: 'dev-team,release-approvers',
+            submitterParameter: 'UAT_APPROVER'
+          )
+        }
+        echo "UAT deploy approved by ${env.UAT_APPROVER}"
+      }
+    }
+
+    // ============ Deploy: UAT ============
+
+    stage('Checkout chart repo') {
+      steps {
+        dir('helm-charts') {
+          git branch: 'main', url: 'git@github.com:org/helm-charts.git', credentialsId: 'chart-repo-deploy-key'
+        }
+      }
+    }
+
+    stage('Update kubeconfig') {
+      steps {
+        // this job's credentials/IAM role should be scoped ONLY to UAT namespace(s) —
+        // no prod access from this job at all, that's the whole point of the split
+        sh "aws eks update-kubeconfig --name ${CLUSTER} --region ${REGION}"
+      }
+    }
+
+    stage('Helm diff - UAT') {
+      steps {
+        dir('helm-charts') {
+          sh """
+            helm diff upgrade ${RELEASE} ${CHART_DIR} \
+              -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
+              --set image.tag=${IMAGE_TAG} \
+              -n ${params.UAT_NAMESPACE} || true
+          """
+        }
+      }
+    }
+
+    stage('Bump UAT values + commit') {
+      steps {
+        dir('helm-charts') {
+          sh """
+            yq e -i '.image.tag = "${IMAGE_TAG}"' ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
+            git commit -am "deploy myapp ${IMAGE_TAG} to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}) [ci skip]"
+            git push origin main
+          """
+        }
+      }
+    }
+
+    stage('Deploy to UAT') {
+      steps {
+        dir('helm-charts') {
+          sh """
+            helm upgrade --install ${RELEASE} ${CHART_DIR} \
+              -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
+              --set image.tag=${IMAGE_TAG} \
+              -n ${params.UAT_NAMESPACE} --atomic --timeout 3m --wait
+          """
+        }
+      }
+    }
+
+    stage('Smoke test - UAT') {
+      steps {
+        sh "curl -f --max-time 10 https://${params.UAT_NAMESPACE}.internal.myapp.com/healthz"
+      }
+    }
+  }
+
+  post {
+    success {
+      sh """
+        curl -X POST -H 'Content-type: application/json' \
+          -d '{"text":"✅ myapp ${IMAGE_TAG} built + deployed to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}). Trigger myapp-deploy-prod manually with this IMAGE_TAG to promote."}' \$SLACK_WEBHOOK
+      """
+    }
+    failure {
+      // --atomic already reverted UAT if the deploy stage itself failed.
+      // Sync git so declared state matches whatever Helm rolled back to.
+      dir('helm-charts') {
+        sh """
+          if helm status ${RELEASE} -n ${params.UAT_NAMESPACE} >/dev/null 2>&1; then
+            LAST_GOOD=\$(helm get values ${RELEASE} -n ${params.UAT_NAMESPACE} -o json | jq -r '.image.tag')
+            yq e -i ".image.tag = \\"\$LAST_GOOD\\"" ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
+            git commit -am "sync values after UAT deploy failure" || true
+            git push origin main || true
+          fi
+        """
+      }
+      sh """
+        curl -X POST -H 'Content-type: application/json' \
+          -d '{"text":"❌ myapp-ci-uat FAILED for ${IMAGE_TAG} — check which stage"}' \$SLACK_WEBHOOK
+      """
+    }
+    aborted {
+      sh """
+        curl -X POST -H 'Content-type: application/json' \
+          -d '{"text":"⏸️ myapp-ci-uat aborted for ${IMAGE_TAG} — likely UAT deploy approval declined"}' \$SLACK_WEBHOOK
+      """
+    }
+  }
+}
