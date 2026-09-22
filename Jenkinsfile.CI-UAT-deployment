@@ -168,21 +168,11 @@ pipeline {
 
       stages {
 
-       stage('Checkout chart repo') {
+        stage('Checkout chart repo') {
           steps {
-            sshagent(['helm-charts-deploy-key']) {
-            sh 'ssh-add -l'
-            git branch: 'main', url: 'git@github.com:akashmhetre12/Helm_charts.git'
-          }
-
-          sshagent(['helm-charts-deploy-key']) {
-            sh 'ssh-add -l'
-            sh 'GIT_SSH_COMMAND="ssh -v" git ls-remote git@github.com:akashmhetre12/Helm_charts.git 2>&1 | tail -60'
-            git branch: 'main', url: 'git@github.com:akashmhetre12/Helm_charts.git'
-          }
             dir('helm-charts') {
-              sshagent(['helm-charts-deploy-key']) {
-                git branch: 'main', url: 'git@github.com:akashmhetre12/Helm_charts.git'
+              withCredentials([string(credentialsId: 'Helm', variable: 'GIT_TOKEN')]) {
+                git branch: 'main', url: "https://${GIT_TOKEN}@github.com/akashmhetre12/Helm_charts.git"
               }
             }
           }
@@ -216,8 +206,9 @@ pipeline {
       stage('Bump UAT values + commit') {
         steps {
           dir('helm-charts') {
-            sshagent(['helm-charts-deploy-key']) {
+            withCredentials([string(credentialsId: 'Helm', variable: 'GIT_TOKEN')]) {
               sh """
+                git remote set-url origin https://${GIT_TOKEN}@github.com/akashmhetre12/Helm_charts.git
                 yq e -i '.image.tag = "${env.IMAGE_TAG}"' ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
                 git commit -am "deploy myapp ${env.IMAGE_TAG} to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}) [ci skip]"
                 git push origin main
@@ -225,7 +216,7 @@ pipeline {
             }
           }
         }
-    }
+      }
 
         stage('Deploy to UAT') {
           steps {
