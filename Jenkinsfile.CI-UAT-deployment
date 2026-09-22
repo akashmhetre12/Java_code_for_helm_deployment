@@ -201,9 +201,10 @@ pipeline {
           }
         }
 
-        stage('Bump UAT values + commit') {
-          steps {
-            dir('helm-charts') {
+      stage('Bump UAT values + commit') {
+        steps {
+          dir('helm-charts') {
+            sshagent(['helm-charts-deploy-key']) {
               sh """
                 yq e -i '.image.tag = "${env.IMAGE_TAG}"' ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
                 git commit -am "deploy myapp ${env.IMAGE_TAG} to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}) [ci skip]"
@@ -212,6 +213,7 @@ pipeline {
             }
           }
         }
+    }
 
         stage('Deploy to UAT') {
           steps {
