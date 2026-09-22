@@ -73,7 +73,7 @@ pipeline {
 
         stage('SonarQube analysis') {
     steps {
-        withSonarQubeEnv('sonar-scanner') {
+        withSonarQubeEnv('sonar-scanner-admin') {
             sh '''
                 SONAR_TOKEN=$(aws secretsmanager get-secret-value \
                   --secret-id sonar-scanner \
