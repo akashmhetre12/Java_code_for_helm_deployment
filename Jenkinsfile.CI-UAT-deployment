@@ -17,7 +17,7 @@ pipeline {
   }
 
   environment {
-    ECR_REPO     = '123456789.dkr.ecr.ap-south-1.amazonaws.com/myapp'   // still a real registry — kind just can't run the cluster itself
+    ECR_REPO     = '158527855865.dkr.ecr.ap-south-1.amazonaws.com/helm-nginx'   // still a real registry — kind just can't run the cluster itself
     REGION       = 'ap-south-1'    // only used for the ECR login, not for cluster access
     KIND_CLUSTER = 'uat-cluster'   // name you pass to `kind create cluster --name`
     CHART_DIR    = 'myapp'
@@ -80,12 +80,6 @@ pipeline {
               --query 'SecretString' \
               --output text | jq -r '."sonar-scanner"')
 
-            if [ -z "$SONAR_TOKEN" ] || [ "$SONAR_TOKEN" = "null" ]; then
-                echo "ERROR: SONAR_TOKEN is empty"
-                exit 1
-            fi
-
-            echo "Sonar token fetched successfully"
 
             ${SCANNER_HOME}/bin/sonar-scanner \
               -Dsonar.host.url=http://172.31.1.60:9000 \
