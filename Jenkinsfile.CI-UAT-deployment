@@ -21,8 +21,8 @@ pipeline {
     REGION       = 'ap-south-1'    // only used for the ECR login, not for cluster access
     KIND_CLUSTER = 'uat-cluster'   // name you pass to `kind create cluster --name`
     CHART_DIR    = 'myapp'
-    IMAGE_TAG    = "${env.GIT_COMMIT[0..7]}"   // this is the artifact BOTH stages key off of
-    RELEASE      = "myapp-${params.UAT_NAMESPACE}"
+    // IMAGE_TAG and RELEASE are NOT set here — they depend on GIT_COMMIT, which
+    // isn't guaranteed to exist yet before checkout runs. Set below instead.
   }
 
   stages {
@@ -47,6 +47,12 @@ pipeline {
         stage('Checkout app repo') {
           steps {
             checkout scm
+            script {
+              // Set these here, AFTER checkout, so GIT_COMMIT is guaranteed to exist —
+              // this is what was missing before and caused the MissingPropertyException.
+              env.IMAGE_TAG = sh(script: 'git rev-parse --short=8 HEAD', returnStdout: true).trim()
+              env.RELEASE   = "myapp-${params.UAT_NAMESPACE}"
+            }
           }
         }
 
@@ -105,14 +111,14 @@ pipeline {
 
         stage('Build image') {
           steps {
-            sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+            sh "docker build -t ${ECR_REPO}:${env.IMAGE_TAG} ."
           }
         }
 
         /*
         stage('Trivy image scan') {
           steps {
-            sh "trivy image --severity CRITICAL,HIGH --exit-code 1 ${ECR_REPO}:${IMAGE_TAG}"
+            sh "trivy image --severity CRITICAL,HIGH --exit-code 1 ${ECR_REPO}:${env.IMAGE_TAG}"
           }
         }
         */
@@ -121,7 +127,7 @@ pipeline {
           steps {
             sh """
               aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REPO}
-              docker push ${ECR_REPO}:${IMAGE_TAG}
+              docker push ${ECR_REPO}:${env.IMAGE_TAG}
             """
           }
         }
@@ -136,7 +142,7 @@ pipeline {
       steps {
         script {
           def approver = input(
-            message: "CI passed for ${IMAGE_TAG}. Deploy to UAT (${params.UAT_NAMESPACE})?",
+            message: "CI passed for ${env.IMAGE_TAG}. Deploy to UAT (${params.UAT_NAMESPACE})?",
             ok: 'Deploy',
             submitter: 'dev-team,release-approvers',
             submitterParameter: 'UAT_APPROVER'
@@ -177,9 +183,9 @@ pipeline {
           steps {
             dir('helm-charts') {
               sh """
-                helm diff upgrade ${RELEASE} ${CHART_DIR} \
+                helm diff upgrade ${env.RELEASE} ${CHART_DIR} \
                   -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
-                  --set image.tag=${IMAGE_TAG} \
+                  --set image.tag=${env.IMAGE_TAG} \
                   -n ${params.UAT_NAMESPACE} || true
               """
             }
@@ -190,8 +196,8 @@ pipeline {
           steps {
             dir('helm-charts') {
               sh """
-                yq e -i '.image.tag = "${IMAGE_TAG}"' ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
-                git commit -am "deploy myapp ${IMAGE_TAG} to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}) [ci skip]"
+                yq e -i '.image.tag = "${env.IMAGE_TAG}"' ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
+                git commit -am "deploy myapp ${env.IMAGE_TAG} to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}) [ci skip]"
                 git push origin main
               """
             }
@@ -202,9 +208,9 @@ pipeline {
           steps {
             dir('helm-charts') {
               sh """
-                helm upgrade --install ${RELEASE} ${CHART_DIR} \
+                helm upgrade --install ${env.RELEASE} ${CHART_DIR} \
                   -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
-                  --set image.tag=${IMAGE_TAG} \
+                  --set image.tag=${env.IMAGE_TAG} \
                   -n ${params.UAT_NAMESPACE} --atomic --timeout 3m --wait
               """
             }
@@ -224,7 +230,7 @@ pipeline {
     success {
       sh """
         curl -X POST -H 'Content-type: application/json' \
-          -d '{"text":"✅ myapp ${IMAGE_TAG} built + deployed to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}). Trigger myapp-deploy-prod manually with this IMAGE_TAG to promote."}' \$SLACK_WEBHOOK
+          -d '{"text":"✅ myapp ${env.IMAGE_TAG} built + deployed to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}). Trigger myapp-deploy-prod manually with this IMAGE_TAG to promote."}' \$SLACK_WEBHOOK
       """
     }
     failure {
@@ -236,8 +242,8 @@ pipeline {
       node('worker') {
         dir('helm-charts') {
           sh """
-            if helm status ${RELEASE} -n ${params.UAT_NAMESPACE} >/dev/null 2>&1; then
-              LAST_GOOD=\$(helm get values ${RELEASE} -n ${params.UAT_NAMESPACE} -o json | jq -r '.image.tag')
+            if helm status ${env.RELEASE} -n ${params.UAT_NAMESPACE} >/dev/null 2>&1; then
+              LAST_GOOD=\$(helm get values ${env.RELEASE} -n ${params.UAT_NAMESPACE} -o json | jq -r '.image.tag')
               yq e -i ".image.tag = \\"\$LAST_GOOD\\"" ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
               git commit -am "sync values after UAT deploy failure" || true
               git push origin main || true
@@ -247,13 +253,13 @@ pipeline {
       }
       sh """
         curl -X POST -H 'Content-type: application/json' \
-          -d '{"text":"❌ myapp-ci-uat FAILED for ${IMAGE_TAG} — check which stage"}' \$SLACK_WEBHOOK
+          -d '{"text":"❌ myapp-ci-uat FAILED for ${env.IMAGE_TAG} — check which stage"}' \$SLACK_WEBHOOK
       """
     }
     aborted {
       sh """
         curl -X POST -H 'Content-type: application/json' \
-          -d '{"text":"⏸️ myapp-ci-uat aborted for ${IMAGE_TAG} — likely UAT deploy approval declined"}' \$SLACK_WEBHOOK
+          -d '{"text":"⏸️ myapp-ci-uat aborted for ${env.IMAGE_TAG} — likely UAT deploy approval declined"}' \$SLACK_WEBHOOK
       """
     }
   }
