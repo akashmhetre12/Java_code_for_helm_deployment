@@ -174,6 +174,12 @@ pipeline {
             sh 'ssh-add -l'
             git branch: 'main', url: 'git@github.com:akashmhetre12/Helm_charts.git'
           }
+
+          sshagent(['helm-charts-deploy-key']) {
+            sh 'ssh-add -l'
+            sh 'GIT_SSH_COMMAND="ssh -v" git ls-remote git@github.com:akashmhetre12/Helm_charts.git 2>&1 | tail -60'
+            git branch: 'main', url: 'git@github.com:akashmhetre12/Helm_charts.git'
+          }
             dir('helm-charts') {
               sshagent(['helm-charts-deploy-key']) {
                 git branch: 'main', url: 'git@github.com:akashmhetre12/Helm_charts.git'
