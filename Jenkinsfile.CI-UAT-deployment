@@ -88,7 +88,7 @@ pipeline {
             echo "Sonar token fetched successfully"
 
             ${SCANNER_HOME}/bin/sonar-scanner \
-              -Dsonar.host.url=http://3.110.55.64:9000 \
+              -Dsonar.host.url=http://172.31.1.60:9000 \
               -Dsonar.projectKey=Helm \
               -Dsonar.projectName=Helm \
               -Dsonar.java.binaries=target/classes \
