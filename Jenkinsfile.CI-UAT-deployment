@@ -71,31 +71,29 @@ pipeline {
           }
         }
 
-        stage('SonarQube analysis') {
-          steps {
-        withSonarQubeEnv('sonar-scanner-admin') {
-            sh '''
-                SONAR_TOKEN=$(aws secretsmanager get-secret-value \
-                  --secret-id sonar-scanner \
-                  --region ap-south-1 \
-                  --query 'SecretString' \
-                  --output text | jq -r '.sonar_token')
+      stage('SonarQube analysis') {
+    steps {
+        sh '''
+            SONAR_TOKEN=$(aws secretsmanager get-secret-value \
+              --secret-id sonar-scanner \
+              --region ap-south-1 \
+              --query 'SecretString' \
+              --output text | jq -r '."sonar-scanner"')
 
-                if [ -z "$SONAR_TOKEN" ] || [ "$SONAR_TOKEN" = "null" ]; then
-                    echo "ERROR: SONAR_TOKEN is empty"
-                    exit 1
-                fi
+            if [ -z "$SONAR_TOKEN" ] || [ "$SONAR_TOKEN" = "null" ]; then
+                echo "ERROR: SONAR_TOKEN is empty"
+                exit 1
+            fi
 
-                echo "Sonar token fetched successfully"
-                echo "Token length: ${#SONAR_TOKEN}"
+            echo "Sonar token fetched successfully"
 
-                ${SCANNER_HOME}/bin/sonar-scanner \
-                  -Dsonar.projectKey=Helm \
-                  -Dsonar.projectName=Helm \
-                  -Dsonar.java.binaries=target/classes \
-                  -Dsonar.token="$SONAR_TOKEN"
-            '''
-        }
+            ${SCANNER_HOME}/bin/sonar-scanner \
+              -Dsonar.host.url=http://3.110.55.64:9000 \
+              -Dsonar.projectKey=Helm \
+              -Dsonar.projectName=Helm \
+              -Dsonar.java.binaries=target/classes \
+              -Dsonar.token="$SONAR_TOKEN"
+        '''
     }
 }
 
