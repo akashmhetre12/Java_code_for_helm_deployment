@@ -145,20 +145,20 @@ pipeline {
     // ============================================================
     // Manual gate — doesn't need any executor/workspace, so no agent
     // ============================================================
-    stage('Approval for UAT deploy') {
-      agent none
-      steps {
-        script {
-          def approver = input(
-            message: "CI passed for ${env.IMAGE_TAG}. Deploy to UAT (${params.UAT_NAMESPACE})?",
-            ok: 'Deploy',
-            submitter: 'dev-team,release-approvers',
-            submitterParameter: 'UAT_APPROVER'
-          )
-        }
-        echo "UAT deploy approved by ${env.UAT_APPROVER}"
-      }
+ stage('Approval for UAT deploy') {
+  agent none
+  steps {
+    script {
+      def approver = input(
+        message: "CI passed for ${env.IMAGE_TAG}. Deploy to UAT (${params.UAT_NAMESPACE})?",
+        ok: 'Deploy',
+        submitter: 'dev-team,release-approvers',
+        submitterParameter: 'UAT_APPROVER'
+      )
     }
+    echo "UAT deploy approved by ${env.UAT_APPROVER}"
+  }
+}
 
     // ============================================================
     // CD — helm/kubectl against the kind cluster, runs on the worker node
