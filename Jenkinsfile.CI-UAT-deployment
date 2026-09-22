@@ -104,6 +104,7 @@ pipeline {
 
         stage('Build') {
           steps {
+            sh "mvn versions:set -DnewVersion=1.0.0-${env.IMAGE_TAG}-SNAPSHOT -DgenerateBackupPoms=false"
             sh 'mvn package -DskipTests=true'   // already tested above, skip re-running here
           }
         }
