@@ -194,6 +194,7 @@ pipeline {
                 helm diff upgrade ${env.RELEASE} ${CHART_DIR} \
                   -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
                   --set image.tag=${env.IMAGE_TAG} \
+                   --allow-unreleased \
                   -n ${params.UAT_NAMESPACE} || true
               """
             }
