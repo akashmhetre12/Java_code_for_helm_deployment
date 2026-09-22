@@ -72,17 +72,24 @@ pipeline {
         }
 
         stage('SonarQube analysis') {
-          steps {
-            withSonarQubeEnv('sonar-scanner') {
-              sh """
-                ${env.SCANNER_HOME}/bin/sonar-scanner \
+    steps {
+        withSonarQubeEnv('sonar-scanner') {
+            sh '''
+                SONAR_TOKEN=$(aws secretsmanager get-secret-value \
+                  --secret-id sonar-scanner \
+                  --region ap-south-1 \
+                  --query 'SecretString' \
+                  --output text | jq -r '.sonar_token')
+
+                ${SCANNER_HOME}/bin/sonar-scanner \
                   -Dsonar.projectKey=Helm \
                   -Dsonar.projectName=Helm \
-                  -Dsonar.java.binaries=target/classes
-              """
-            }
-          }
+                  -Dsonar.java.binaries=target/classes \
+                  -Dsonar.token="$SONAR_TOKEN"
+            '''
         }
+    }
+}
 
         /*
         stage('OWASP dependency check') {
