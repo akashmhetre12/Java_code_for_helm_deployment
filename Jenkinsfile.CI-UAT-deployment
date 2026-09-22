@@ -168,10 +168,12 @@ pipeline {
 
       stages {
 
-        stage('Checkout chart repo') {
+       stage('Checkout chart repo') {
           steps {
             dir('helm-charts') {
-              git branch: 'main', url: 'https://github.com/akashmhetre12/Helm_charts.git'
+              sshagent(['helm-charts-deploy-key']) {
+                git branch: 'main', url: 'git@github.com:akashmhetre12/Helm_charts.git'
+              }
             }
           }
         }
