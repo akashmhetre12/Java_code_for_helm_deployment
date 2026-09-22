@@ -170,6 +170,10 @@ pipeline {
 
        stage('Checkout chart repo') {
           steps {
+            sshagent(['helm-charts-deploy-key']) {
+            sh 'ssh-add -l'
+            git branch: 'main', url: 'git@github.com:akashmhetre12/Helm_charts.git'
+          }
             dir('helm-charts') {
               sshagent(['helm-charts-deploy-key']) {
                 git branch: 'main', url: 'git@github.com:akashmhetre12/Helm_charts.git'
