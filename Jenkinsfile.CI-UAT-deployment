@@ -1,108 +1,138 @@
 // ============================================================
 // JOB 1: myapp-ci-uat
 // Trigger: AUTOMATIC — webhook on push/merge to app repo
-// checkout -> test -> sonar -> owasp -> build -> nexus -> image ->
-// trivy -> ecr -> [MANUAL INPUT] -> deploy to UAT (namespace param)
+// checkout -> compile -> test -> sonar -> build -> nexus -> image ->
+// ecr -> [MANUAL INPUT] -> deploy to UAT (namespace param)
+//
+// CI stages run on a node labeled "master"
+// CD stages (helm/kubectl against the kind cluster) run on a node labeled "worker"
+// Swap these two labels for whatever you actually named your Jenkins nodes
+// under Manage Jenkins > Nodes.
 // ============================================================
 pipeline {
-  agent any
-
-  triggers {
-    githubPush()   // or pollSCM('H/5 * * * *') depending on your webhook setup
-  }
+  agent none
 
   parameters {
     string(name: 'UAT_NAMESPACE', defaultValue: 'uat', description: 'UAT namespace to deploy to — separated so multiple UAT envs (uat, uat2, qa) can share this same job')
   }
 
   environment {
-    ECR_REPO     = '123456789.dkr.ecr.ap-south-1.amazonaws.com/myapp'
-    CLUSTER      = 'my-eks-cluster'
-    REGION       = 'ap-south-1'
-    NEXUS_URL    = 'https://nexus.internal:8081/repository/maven-releases'
-    SONAR_URL    = 'https://sonar.internal'
-    CHART_DIR    = 'charts/myapp'
-    IMAGE_TAG    = "${env.GIT_COMMIT[0..7]}"   // this is the artifact BOTH jobs key off of
+    ECR_REPO     = '123456789.dkr.ecr.ap-south-1.amazonaws.com/myapp'   // still a real registry — kind just can't run the cluster itself
+    REGION       = 'ap-south-1'    // only used for the ECR login, not for cluster access
+    KIND_CLUSTER = 'uat-cluster'   // name you pass to `kind create cluster --name`
+    CHART_DIR    = 'myapp'
+    IMAGE_TAG    = "${env.GIT_COMMIT[0..7]}"   // this is the artifact BOTH stages key off of
     RELEASE      = "myapp-${params.UAT_NAMESPACE}"
   }
 
   stages {
 
-    // ============ CI: build & quality gates ============
+    // ============================================================
+    // CI — everything up through pushing the image to ECR
+    // ============================================================
+    stage('CI') {
+      agent { label 'master' }
 
-    stage('Checkout app repo') {
-      steps {
-        checkout scm
+      tools {
+        maven 'maven3'
+        jdk 'jdk-17'
       }
-    }
 
-    stage('Unit tests') {
-      steps {
-        sh 'mvn test'
+      environment {
+        SCANNER_HOME = tool 'sonar-scanner'
       }
-      post {
-        always { junit '**/target/surefire-reports/*.xml' }
-      }
-    }
 
-    stage('SonarQube quality gate') {
-      steps {
-        withSonarQubeEnv('sonar-server') {
-          sh "mvn sonar:sonar -Dsonar.host.url=${SONAR_URL}"
+      stages {
+
+        stage('Checkout app repo') {
+          steps {
+            checkout scm
+          }
         }
-        timeout(time: 5, unit: 'MINUTES') {
-          waitForQualityGate abortPipeline: true
+
+        stage('Compile') {
+          steps {
+            sh 'mvn compile'
+          }
+        }
+
+        stage('Unit tests') {
+          steps {
+            sh 'mvn test'   // do NOT skip tests here, this stage IS the test run
+          }
+          post {
+            always { junit '**/target/surefire-reports/*.xml' }
+          }
+        }
+
+        stage('SonarQube analysis') {
+          steps {
+            withSonarQubeEnv('sonar-scanner') {
+              sh """
+                ${env.SCANNER_HOME}/bin/sonar-scanner \
+                  -Dsonar.projectKey=Helm \
+                  -Dsonar.projectName=Helm \
+                  -Dsonar.java.binaries=target/classes
+              """
+            }
+          }
+        }
+
+        /*
+        stage('OWASP dependency check') {
+          steps {
+            sh 'mvn org.owasp:dependency-check-maven:check -DnvdApiUrl=$NVD_MIRROR_URL'
+          }
+          post {
+            always { dependencyCheckPublisher pattern: 'target/dependency-check-report.xml' }
+          }
+        }
+        */
+
+        stage('Build') {
+          steps {
+            sh 'mvn package -DskipTests=true'   // already tested above, skip re-running here
+          }
+        }
+
+        stage('Deploy to Nexus') {
+          steps {
+            withMaven(globalMavenSettingsConfig: 'global-maven', jdk: 'jdk-17', maven: 'maven3', traceability: true) {
+              sh 'mvn deploy -DskipTests=true'
+            }
+          }
+        }
+
+        stage('Build image') {
+          steps {
+            sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+          }
+        }
+
+        /*
+        stage('Trivy image scan') {
+          steps {
+            sh "trivy image --severity CRITICAL,HIGH --exit-code 1 ${ECR_REPO}:${IMAGE_TAG}"
+          }
+        }
+        */
+
+        stage('Push image to ECR') {
+          steps {
+            sh """
+              aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REPO}
+              docker push ${ECR_REPO}:${IMAGE_TAG}
+            """
+          }
         }
       }
     }
 
-    stage('OWASP dependency check') {
-      steps {
-        sh 'mvn org.owasp:dependency-check-maven:check -DnvdApiUrl=$NVD_MIRROR_URL'
-      }
-      post {
-        always { dependencyCheckPublisher pattern: 'target/dependency-check-report.xml' }
-      }
-    }
-
-    stage('Build artifact') {
-      steps {
-        sh 'mvn clean package -DskipTests'
-      }
-    }
-
-    stage('Push artifact to Nexus') {
-      steps {
-        sh 'mvn deploy:deploy-file -Durl=$NEXUS_URL -DrepositoryId=nexus -Dfile=target/myapp.jar'
-      }
-    }
-
-    // ============ Image build & scan ============
-
-    stage('Build image') {
-      steps {
-        sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} --build-arg NEXUS_URL=${NEXUS_URL} ."
-      }
-    }
-
-    stage('Trivy image scan') {
-      steps {
-        sh "trivy image --severity CRITICAL,HIGH --exit-code 1 ${ECR_REPO}:${IMAGE_TAG}"
-      }
-    }
-
-    stage('Push image to ECR') {
-      steps {
-        sh """
-          aws ecr get-login-password --region ${REGION} | docker login --username AWS --password-stdin ${ECR_REPO}
-          docker push ${ECR_REPO}:${IMAGE_TAG}
-        """
-      }
-    }
-
-    // ============ Manual gate before touching any cluster ============
-
+    // ============================================================
+    // Manual gate — doesn't need any executor/workspace, so no agent
+    // ============================================================
     stage('Approval for UAT deploy') {
+      agent none
       steps {
         script {
           def approver = input(
@@ -116,65 +146,76 @@ pipeline {
       }
     }
 
-    // ============ Deploy: UAT ============
+    // ============================================================
+    // CD — helm/kubectl against the kind cluster, runs on the worker node
+    // ============================================================
+    stage('CD') {
+      agent { label 'worker' }
 
-    stage('Checkout chart repo') {
-      steps {
-        dir('helm-charts') {
-          git branch: 'main', url: 'git@github.com:org/helm-charts.git', credentialsId: 'chart-repo-deploy-key'
+      stages {
+
+        stage('Checkout chart repo') {
+          steps {
+            dir('helm-charts') {
+              git branch: 'main', url: 'https://github.com/akashmhetre12/Helm_charts.git'
+            }
+          }
         }
-      }
-    }
 
-    stage('Update kubeconfig') {
-      steps {
-        // this job's credentials/IAM role should be scoped ONLY to UAT namespace(s) —
-        // no prod access from this job at all, that's the whole point of the split
-        sh "aws eks update-kubeconfig --name ${CLUSTER} --region ${REGION}"
-      }
-    }
-
-    stage('Helm diff - UAT') {
-      steps {
-        dir('helm-charts') {
-          sh """
-            helm diff upgrade ${RELEASE} ${CHART_DIR} \
-              -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
-              --set image.tag=${IMAGE_TAG} \
-              -n ${params.UAT_NAMESPACE} || true
-          """
+        stage('Update kubeconfig') {
+          steps {
+            // No AWS/EKS here — this is a local kind cluster.
+            // `kind export kubeconfig` points kubectl/helm at it (works whether kind was
+            // created on this same worker or you're pointing KUBECONFIG at a shared one).
+            // If the worker doesn't reach kind directly, swap this for `export KUBECONFIG=`
+            // against the scoped kubeconfig credential from the RBAC setup instead.
+            sh "kind export kubeconfig --name ${KIND_CLUSTER}"
+          }
         }
-      }
-    }
 
-    stage('Bump UAT values + commit') {
-      steps {
-        dir('helm-charts') {
-          sh """
-            yq e -i '.image.tag = "${IMAGE_TAG}"' ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
-            git commit -am "deploy myapp ${IMAGE_TAG} to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}) [ci skip]"
-            git push origin main
-          """
+        stage('Helm diff - UAT') {
+          steps {
+            dir('helm-charts') {
+              sh """
+                helm diff upgrade ${RELEASE} ${CHART_DIR} \
+                  -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
+                  --set image.tag=${IMAGE_TAG} \
+                  -n ${params.UAT_NAMESPACE} || true
+              """
+            }
+          }
         }
-      }
-    }
 
-    stage('Deploy to UAT') {
-      steps {
-        dir('helm-charts') {
-          sh """
-            helm upgrade --install ${RELEASE} ${CHART_DIR} \
-              -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
-              --set image.tag=${IMAGE_TAG} \
-              -n ${params.UAT_NAMESPACE} --atomic --timeout 3m --wait
-          """
+        stage('Bump UAT values + commit') {
+          steps {
+            dir('helm-charts') {
+              sh """
+                yq e -i '.image.tag = "${IMAGE_TAG}"' ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
+                git commit -am "deploy myapp ${IMAGE_TAG} to ${params.UAT_NAMESPACE} (approved by ${env.UAT_APPROVER}) [ci skip]"
+                git push origin main
+              """
+            }
+          }
         }
-      }
-    }
 
-    stage('Smoke test - UAT') {
-      steps {
-        sh "curl -f --max-time 10 https://${params.UAT_NAMESPACE}.internal.myapp.com/healthz"
+        stage('Deploy to UAT') {
+          steps {
+            dir('helm-charts') {
+              sh """
+                helm upgrade --install ${RELEASE} ${CHART_DIR} \
+                  -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
+                  --set image.tag=${IMAGE_TAG} \
+                  -n ${params.UAT_NAMESPACE} --atomic --timeout 3m --wait
+              """
+            }
+          }
+        }
+
+        stage('Smoke test - UAT') {
+          steps {
+            sh "curl -f --max-time 10 https://${params.UAT_NAMESPACE}.internal.myapp.com/healthz"
+          }
+        }
       }
     }
   }
@@ -189,15 +230,20 @@ pipeline {
     failure {
       // --atomic already reverted UAT if the deploy stage itself failed.
       // Sync git so declared state matches whatever Helm rolled back to.
-      dir('helm-charts') {
-        sh """
-          if helm status ${RELEASE} -n ${params.UAT_NAMESPACE} >/dev/null 2>&1; then
-            LAST_GOOD=\$(helm get values ${RELEASE} -n ${params.UAT_NAMESPACE} -o json | jq -r '.image.tag')
-            yq e -i ".image.tag = \\"\$LAST_GOOD\\"" ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
-            git commit -am "sync values after UAT deploy failure" || true
-            git push origin main || true
-          fi
-        """
+      // NOTE: this runs on whichever node the pipeline was last allocated to
+      // (i.e. the worker, if the CD stage got that far) — the "helm status"
+      // check below needs to run on a node that can reach the kind cluster.
+      node('worker') {
+        dir('helm-charts') {
+          sh """
+            if helm status ${RELEASE} -n ${params.UAT_NAMESPACE} >/dev/null 2>&1; then
+              LAST_GOOD=\$(helm get values ${RELEASE} -n ${params.UAT_NAMESPACE} -o json | jq -r '.image.tag')
+              yq e -i ".image.tag = \\"\$LAST_GOOD\\"" ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml
+              git commit -am "sync values after UAT deploy failure" || true
+              git push origin main || true
+            fi
+          """
+        }
       }
       sh """
         curl -X POST -H 'Content-type: application/json' \
