@@ -21,6 +21,7 @@ pipeline {
     REGION       = 'ap-south-1'    // only used for the ECR login, not for cluster access
     KIND_CLUSTER = 'uat-cluster'   // name you pass to `kind create cluster --name`
     CHART_DIR    = 'myapp'
+    ingress_name = "ec2-13-235-49-143.ap-south-1.compute.amazonaws.com"   // ingress host for UAT, used in helm values override
     // IMAGE_TAG and RELEASE are NOT set here — they depend on GIT_COMMIT, which
     // isn't guaranteed to exist yet before checkout runs. Set below instead.
   }
@@ -197,7 +198,7 @@ pipeline {
                   -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
                   --set image.tag=${env.IMAGE_TAG} \
                   --allow-unreleased \
-                  --set ingress.host=ec2-13-235-49-143.ap-south-1.compute.amazonaws.com \
+                  --set ingress.host=${params.INGRESS_HOST} \
                   -n ${params.UAT_NAMESPACE} || true
               """
             }
@@ -226,7 +227,7 @@ pipeline {
                 helm upgrade --install ${env.RELEASE} ${CHART_DIR}  \
                   -f ${CHART_DIR}/values-${params.UAT_NAMESPACE}.yaml \
                   --set image.tag=${env.IMAGE_TAG} \
-                  --set ingress.host=ec2-13-235-49-143.ap-south-1.compute.amazonaws.com \
+                  --set ingress.host=${params.INGRESS_HOST} \
                   -n ${params.UAT_NAMESPACE} --atomic --timeout 3m --wait
               """
             }
@@ -235,7 +236,7 @@ pipeline {
 
         stage('Smoke test - UAT') {
           steps {
-            sh "curl -f --max-time 10 https://${params.UAT_NAMESPACE}.internal.myapp.com/healthz"
+            sh "curl -f --max-time 10 https://${params.INGRESS_HOST}/healthz"
           }
         }
       }
